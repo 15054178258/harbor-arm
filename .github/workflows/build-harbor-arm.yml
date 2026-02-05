@@ -16,15 +16,19 @@ jobs:
         with:
           repository: goharbor/harbor
           ref: v2.10.3
-          # 将源码检出到 'harbor_src' 目录，避免与根目录混淆
           path: harbor_src
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.21'
-          # 自动管理缓存，加速构建
-          cache-dependency-path: harbor_src/src/go.mod
+
+      # 关键补充：安装 go-swagger
+      - name: Install Swagger
+        run: |
+          download_url=$(curl -s https://api.github.com/repos/go-swagger/go-swagger/releases/latest | grep "browser_download_url.*_linux_amd64" | cut -d '"' -f 4)
+          sudo curl -o /usr/local/bin/swagger -L $download_url
+          sudo chmod +x /usr/local/bin/swagger
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -39,8 +43,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 第一步：编译 ARM64 二进制文件
-      # 重点：必须在 harbor_src/src 目录下运行，因为 go.mod 在那里
+      # 生成缺失的 REST API 代码
+      - name: Generate API Code
+        run: |
+          cd harbor_src/src/server/v2.0
+          # 根据 Harbor 的 swagger.yaml 生成代码
+          swagger generate server -f ../../../api/v2.0/swagger.yaml --target . --model-package models --server-package restapi --exclude-main
+
       - name: Compile Harbor Binaries (ARM64)
         env:
           GOOS: linux
@@ -48,9 +57,7 @@ jobs:
           CGO_ENABLED: 0
         run: |
           cd harbor_src/src
-          
-          echo "Fetching dependencies..."
-          go mod download
+          go mod tidy  # 确保生成的代码被识别
           
           echo "Compiling Core..."
           go build -v -o ../make/photon/core/harbor_core ./core
@@ -61,17 +68,12 @@ jobs:
           echo "Compiling Registryctl..."
           go build -v -o ../make/photon/registryctl/harbor_registryctl ./registryctl
 
-      # 第二步：对 Redis 进行 64KB Page Size 补丁处理
+      # 补丁与构建步骤（保持不变...）
       - name: Patch Redis for ARM
         run: |
           cd harbor_src
-          if [ -f make/photon/redis/Dockerfile ]; then
-            sed -i 's/--with-lg-page=12/--with-lg-page=16/g' make/photon/redis/Dockerfile || true
-            echo "Redis Dockerfile patched for 64KB Page Size"
-          fi
+          sed -i 's/--with-lg-page=12/--with-lg-page=16/g' make/photon/redis/Dockerfile || true
 
-      # 第三步：构建并推送镜像
-      # 注意：context 路径需要指向修改后的 harbor_src/make/photon/...
       - name: Build and Push Core Image
         run: |
           docker buildx build \
@@ -80,12 +82,3 @@ jobs:
             --build-arg harbor_base_image_version=v2.10.3 \
             -t ghcr.io/${{ github.repository_owner }}/harbor-core:v2.10.3-arm64 \
             -f harbor_src/make/photon/core/Dockerfile ./harbor_src/make/photon/core --push
-
-      - name: Build and Push Redis Image
-        run: |
-          docker buildx build \
-            --platform linux/arm64 \
-            --build-arg harbor_base_namespace=goharbor \
-            --build-arg harbor_base_image_version=v2.10.3 \
-            -t ghcr.io/${{ github.repository_owner }}/harbor-redis:v2.10.3-arm64 \
-            -f harbor_src/make/photon/redis/Dockerfile ./harbor_src/make/photon/redis --push
