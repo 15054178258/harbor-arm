@@ -42,16 +42,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 关键修复：使用 go work 或手动修复 go.mod 替换路径
-      # Harbor 的 src/go.mod 默认可能包含一些指向父目录的引用，导致在 Actions 环境下解析失败
-      - name: Generate All Required Code
+      # 核心修复步骤：生成代码并强制清理 Go Module 冲突
+      - name: Generate API Code and Fix Module
         run: |
           cd harbor_src/src
-          # 执行 Swagger 生成，不仅是 v2.0，确保全量生成
+          
+          # 1. 确保目标目录存在
+          mkdir -p server/v2.0/restapi
+          
+          # 2. 生成代码
           swagger generate server -f ../api/v2.0/swagger.yaml --target ./server/v2.0 --model-package models --server-package restapi --exclude-main
-          # 运行 go mod tidy 强制 Go 重新扫描目录结构并识别新生成的 package
+          
+          # 3. 关键：删除可能导致干扰的 vendor 目录并重新同步
+          rm -rf vendor/
           go mod tidy
-
+          
       - name: Compile Harbor Binaries (ARM64)
         env:
           GOOS: linux
@@ -60,7 +65,7 @@ jobs:
         run: |
           cd harbor_src/src
           
-          # 必须使用 -mod=mod 标志，强制 Go 忽略旧的 vendor 记录（如果有的话）并查找新生成的代码
+          # 使用 -mod=mod 强制忽略版本库缓存，直接读取本地生成的物理文件
           echo "Compiling Core..."
           go build -mod=mod -v -o ../make/photon/core/harbor_core ./core
           
@@ -70,13 +75,14 @@ jobs:
           echo "Compiling Registryctl..."
           go build -mod=mod -v -o ../make/photon/registryctl/harbor_registryctl ./registryctl
 
-      # 为 Core 准备必要的静态资源
-      # Dockerfile 中会 COPY 这些文件，如果缺失，buildx 会报错
+      # 补全 Docker 构建所需的静态文件 (否则 Dockerfile COPY 会报错)
       - name: Prepare Static Resources
         run: |
           cd harbor_src
           cp -r src/core/static make/photon/core/
           cp -r src/core/views make/photon/core/
+          # 还需要这个配置文件模板
+          cp src/core/app.conf make/photon/core/ || true
 
       - name: Patch Redis for ARM
         run: |
