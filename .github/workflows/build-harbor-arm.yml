@@ -3,7 +3,6 @@ name: Build Harbor ARM v2.10.3 to GHCR
 on:
   workflow_dispatch:
 
-# 必须声明权限，否则无法推送到 GHCR
 permissions:
   contents: read
   packages: write
@@ -17,11 +16,15 @@ jobs:
         with:
           repository: goharbor/harbor
           ref: v2.10.3
+          # 将源码检出到 'harbor_src' 目录，避免与根目录混淆
+          path: harbor_src
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21' # Harbor 2.10.x 建议使用 1.21
+          go-version: '1.21'
+          # 自动管理缓存，加速构建
+          cache-dependency-path: harbor_src/src/go.mod
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -36,31 +39,39 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 第一步：编译 ARM64 二进制文件 (Core 和 Jobservice)
-      # 只有这样 Dockerfile 里的 COPY 语句才不会报错
+      # 第一步：编译 ARM64 二进制文件
+      # 重点：必须在 harbor_src/src 目录下运行，因为 go.mod 在那里
       - name: Compile Harbor Binaries (ARM64)
         env:
           GOOS: linux
           GOARCH: arm64
           CGO_ENABLED: 0
         run: |
-          # 编译 core
-          go build -v -o make/photon/core/harbor_core ./src/core
-          # 编译 jobservice
-          go build -v -o make/photon/jobservice/harbor_jobservice ./src/jobservice
-          # 编译 registryctl
-          go build -v -o make/photon/registryctl/harbor_registryctl ./src/registryctl
+          cd harbor_src/src
+          
+          echo "Fetching dependencies..."
+          go mod download
+          
+          echo "Compiling Core..."
+          go build -v -o ../make/photon/core/harbor_core ./core
+          
+          echo "Compiling Jobservice..."
+          go build -v -o ../make/photon/jobservice/harbor_jobservice ./jobservice
+          
+          echo "Compiling Registryctl..."
+          go build -v -o ../make/photon/registryctl/harbor_registryctl ./registryctl
 
-      # 第二步：参考博客，对 Redis 进行补丁处理 (适配 64KB Page Size)
+      # 第二步：对 Redis 进行 64KB Page Size 补丁处理
       - name: Patch Redis for ARM
         run: |
-          # 修改 Redis 编译参数，确保支持国产化 ARM 环境的 Page Size
+          cd harbor_src
           if [ -f make/photon/redis/Dockerfile ]; then
             sed -i 's/--with-lg-page=12/--with-lg-page=16/g' make/photon/redis/Dockerfile || true
+            echo "Redis Dockerfile patched for 64KB Page Size"
           fi
 
       # 第三步：构建并推送镜像
-      # 这里解决了你遇到的参数为空导致报错的问题
+      # 注意：context 路径需要指向修改后的 harbor_src/make/photon/...
       - name: Build and Push Core Image
         run: |
           docker buildx build \
@@ -68,7 +79,7 @@ jobs:
             --build-arg harbor_base_namespace=goharbor \
             --build-arg harbor_base_image_version=v2.10.3 \
             -t ghcr.io/${{ github.repository_owner }}/harbor-core:v2.10.3-arm64 \
-            -f make/photon/core/Dockerfile ./make/photon/core --push
+            -f harbor_src/make/photon/core/Dockerfile ./harbor_src/make/photon/core --push
 
       - name: Build and Push Redis Image
         run: |
@@ -77,6 +88,4 @@ jobs:
             --build-arg harbor_base_namespace=goharbor \
             --build-arg harbor_base_image_version=v2.10.3 \
             -t ghcr.io/${{ github.repository_owner }}/harbor-redis:v2.10.3-arm64 \
-            -f make/photon/redis/Dockerfile ./make/photon/redis --push
-
-      # 可以根据需要继续添加 Jobservice, Portal 等组件的构建步骤
+            -f harbor_src/make/photon/redis/Dockerfile ./harbor_src/make/photon/redis --push
