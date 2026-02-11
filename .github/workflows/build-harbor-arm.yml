@@ -1,19 +1,19 @@
-name: Build and Release Harbor ARM64
+name: Harbor ARM64 Full Release Factory
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Harbor 版本号 (例如: v2.14.0)'
+        description: 'Harbor Version (e.g., v2.10.2 or v2.14.0)'
         required: true
         default: 'v2.14.0'
 
 jobs:
-  release-arm-harbor:
+  build-and-release:
     runs-on: ubuntu-latest
-    permissions: # 必须开启写入权限才能创建 Release
+    permissions:
       contents: write
-    
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,60 +24,94 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Prepare ARM64 Images
+      - name: Prepare Full ARM64 Images
+        id: prepare_images
         run: |
           VERSION="${{ github.event.inputs.version }}"
           SOURCE_REGISTRY="ghcr.io/octohelm/harbor"
           TARGET_REGISTRY="goharbor"
           
-          # 定义镜像映射列表
-          IMAGES=(
-            "harbor-log" "registry-photon" "harbor-registryctl" 
-            "harbor-db" "harbor-core" "harbor-portal" 
-            "harbor-jobservice" "redis-photon" "nginx-photon"
+          # 核心镜像列表：完整对齐官方 offline installer
+          declare -A IMAGES=(
+            ["harbor-log"]="harbor-log"
+            ["registry-photon"]="registry-photon"
+            ["harbor-registryctl"]="harbor-registryctl"
+            ["harbor-db"]="harbor-db"
+            ["harbor-core"]="harbor-core"
+            ["harbor-portal"]="harbor-portal"
+            ["harbor-jobservice"]="harbor-jobservice"
+            ["redis-photon"]="redis-photon"
+            ["nginx-photon"]="nginx-photon"
+            ["harbor-exporter"]="harbor-exporter"
+            ["chartmuseum-photon"]="chartmuseum-photon"
+            ["trivy-adapter-photon"]="trivy-adapter-photon"
+            ["prepare-photon"]="harbor-prepare"
           )
           
-          echo "🚀 正在拉取并处理 ARM64 镜像..."
+          echo "🚀 正在处理全量 ARM64 镜像..."
           FINAL_TAGS=()
-          for img in "${IMAGES[@]}"; do
-            docker pull --platform linux/arm64 "$SOURCE_REGISTRY/$img:$VERSION"
-            docker tag "$SOURCE_REGISTRY/$img:$VERSION" "$TARGET_REGISTRY/$img:$VERSION"
-            FINAL_TAGS+=("$TARGET_REGISTRY/$img:$VERSION")
+          for KEY in "${!IMAGES[@]}"; do
+            SOURCE_IMG="$SOURCE_REGISTRY/$KEY:$VERSION"
+            TARGET_IMG="$TARGET_REGISTRY/${IMAGES[$KEY]}:$VERSION"
+            
+            echo "📥 Pulling: $SOURCE_IMG"
+            # 尝试拉取，如果失败则输出警告并跳过（兼容部分版本缺少组件的情况）
+            if docker pull --platform linux/arm64 "$SOURCE_IMG"; then
+                docker tag "$SOURCE_IMG" "$TARGET_IMG"
+                FINAL_TAGS+=("$TARGET_IMG")
+                echo "✅ Tagged: $TARGET_IMG"
+            else
+                echo "⚠️ Skip: $SOURCE_IMG 不存在于源仓库"
+            fi
           done
           
-          echo "📦 正在打包镜像..."
+          echo "📦 正在生成最终镜像包 (tar.gz)..."
           docker save "${FINAL_TAGS[@]}" -o harbor.$VERSION.tar
           gzip -9 harbor.$VERSION.tar
-          echo "镜像包已生成: harbor.$VERSION.tar.gz"
+          echo "IMAGE_FILE=harbor.$VERSION.tar.gz" >> $GITHUB_ENV
 
-      - name: Download and Patch Official Installer
+      - name: Patch and Package Installer
         run: |
           VERSION="${{ github.event.inputs.version }}"
+          INSTALLER_FILE="harbor-offline-installer-$VERSION.tgz"
           
-          echo "📥 下载官方 $VERSION 离线安装包..."
-          wget -q https://github.com/goharbor/harbor/releases/download/$VERSION/harbor-offline-installer-$VERSION.tgz
+          echo "📥 下载官方离线安装包模板..."
+          wget -q "https://github.com/goharbor/harbor/releases/download/$VERSION/$INSTALLER_FILE"
           
-          echo "🛠️ 替换镜像文件..."
-          tar -xvf harbor-offline-installer-$VERSION.tgz
-          # 替换 x86 镜像为我们生成的 ARM 镜像
-          mv harbor.$VERSION.tar.gz harbor/harbor.$VERSION.tar.gz
+          echo "🛠️ 正在替换架构包..."
+          tar -xvf "$INSTALLER_FILE"
           
-          echo "打包最终安装程序..."
-          tar -zcvf harbor-arm64-installer-$VERSION.tgz harbor/
+          # 官方包解压后会有 harbor/ 目录，里面有原版的 harbor.v2.x.tar.gz
+          # 我们用自己生成的全量 ARM 包直接覆盖它
+          mv "harbor.$VERSION.tar.gz" "harbor/harbor.$VERSION.tar.gz"
+          
+          # 重新压缩为 ARM 版安装包
+          FINAL_PACKAGE="harbor-arm64-installer-$VERSION.tgz"
+          tar -zcvf "$FINAL_PACKAGE" harbor/
+          echo "FINAL_PACKAGE=$FINAL_PACKAGE" >> $GITHUB_ENV
 
       - name: Create GitHub Release
-        id: create_release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.version }}-arm64
           name: Harbor ARM64 Release ${{ github.event.inputs.version }}
           body: |
-            Harbor ARM64 离线安装包 自动构建版
-            - 基础版本: ${{ github.event.inputs.version }}
-            - 架构: linux/arm64
-            - 镜像来源: octohelm/harbor (Photon OS Based)
-          draft: false
-          prerelease: false
+            ### Harbor ARM64 离线安装包
+            - **版本**: ${{ github.event.inputs.version }}
+            - **架构**: linux/arm64
+            - **构建时间**: ${{ github.event.repository.updated_at }}
+            
+            **包含组件**:
+            - Harbor Core / Jobservice / Portal / Log
+            - Registry / Registryctl
+            - Redis / Nginx / DB (Postgres)
+            - Exporter / Chartmuseum / Trivy Adapter
+            - **Prepare (关键安装组件)**
+            
+            **使用方法**:
+            1. 下载后上传至 ARM 服务器。
+            2. `tar -xvf harbor-arm64-installer-${{ github.event.inputs.version }}.tgz`
+            3. 修改 `harbor.yml` 后执行 `./install.sh`
           files: |
             harbor-arm64-installer-*.tgz
         env:
