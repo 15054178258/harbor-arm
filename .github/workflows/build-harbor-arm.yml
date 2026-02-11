@@ -1,33 +1,22 @@
-name: Build Harbor ARM v2.10.3 to GHCR
+name: Build and Release Harbor ARM64
 
 on:
   workflow_dispatch:
-
-permissions:
-  contents: read
-  packages: write
+    inputs:
+      version:
+        description: 'Harbor 版本号 (例如: v2.14.0)'
+        required: true
+        default: 'v2.14.0'
 
 jobs:
-  build-harbor-arm:
+  release-arm-harbor:
     runs-on: ubuntu-latest
+    permissions: # 必须开启写入权限才能创建 Release
+      contents: write
+    
     steps:
-      - name: Checkout Harbor Source
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          repository: goharbor/harbor
-          ref: v2.10.3
-          path: harbor_src
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.21'
-
-      - name: Install Swagger
-        run: |
-          download_url=$(curl -s https://api.github.com/repos/go-swagger/go-swagger/releases/latest | grep "browser_download_url.*_linux_amd64" | cut -d '"' -f 4)
-          sudo curl -o /usr/local/bin/swagger -L $download_url
-          sudo chmod +x /usr/local/bin/swagger
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -35,74 +24,61 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to GHCR
-        uses: docker/login-action@v3
+      - name: Prepare ARM64 Images
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          SOURCE_REGISTRY="ghcr.io/octohelm/harbor"
+          TARGET_REGISTRY="goharbor"
+          
+          # 定义镜像映射列表
+          IMAGES=(
+            "harbor-log" "registry-photon" "harbor-registryctl" 
+            "harbor-db" "harbor-core" "harbor-portal" 
+            "harbor-jobservice" "redis-photon" "nginx-photon"
+          )
+          
+          echo "🚀 正在拉取并处理 ARM64 镜像..."
+          FINAL_TAGS=()
+          for img in "${IMAGES[@]}"; do
+            docker pull --platform linux/arm64 "$SOURCE_REGISTRY/$img:$VERSION"
+            docker tag "$SOURCE_REGISTRY/$img:$VERSION" "$TARGET_REGISTRY/$img:$VERSION"
+            FINAL_TAGS+=("$TARGET_REGISTRY/$img:$VERSION")
+          done
+          
+          echo "📦 正在打包镜像..."
+          docker save "${FINAL_TAGS[@]}" -o harbor.$VERSION.tar
+          gzip -9 harbor.$VERSION.tar
+          echo "镜像包已生成: harbor.$VERSION.tar.gz"
+
+      - name: Download and Patch Official Installer
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          
+          echo "📥 下载官方 $VERSION 离线安装包..."
+          wget -q https://github.com/goharbor/harbor/releases/download/$VERSION/harbor-offline-installer-$VERSION.tgz
+          
+          echo "🛠️ 替换镜像文件..."
+          tar -xvf harbor-offline-installer-$VERSION.tgz
+          # 替换 x86 镜像为我们生成的 ARM 镜像
+          mv harbor.$VERSION.tar.gz harbor/harbor.$VERSION.tar.gz
+          
+          echo "打包最终安装程序..."
+          tar -zcvf harbor-arm64-installer-$VERSION.tgz harbor/
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # 核心修复步骤：生成代码并强制清理 Go Module 冲突
-      - name: Generate API Code and Fix Module
-        run: |
-          cd harbor_src/src
-          
-          # 1. 确保目标目录存在
-          mkdir -p server/v2.0/restapi
-          
-          # 2. 生成代码
-          swagger generate server -f ../api/v2.0/swagger.yaml --target ./server/v2.0 --model-package models --server-package restapi --exclude-main
-          
-          # 3. 关键：删除可能导致干扰的 vendor 目录并重新同步
-          rm -rf vendor/
-          go mod tidy
-          
-      - name: Compile Harbor Binaries (ARM64)
+          tag_name: ${{ github.event.inputs.version }}-arm64
+          name: Harbor ARM64 Release ${{ github.event.inputs.version }}
+          body: |
+            Harbor ARM64 离线安装包 自动构建版
+            - 基础版本: ${{ github.event.inputs.version }}
+            - 架构: linux/arm64
+            - 镜像来源: octohelm/harbor (Photon OS Based)
+          draft: false
+          prerelease: false
+          files: |
+            harbor-arm64-installer-*.tgz
         env:
-          GOOS: linux
-          GOARCH: arm64
-          CGO_ENABLED: 0
-        run: |
-          cd harbor_src/src
-          
-          # 使用 -mod=mod 强制忽略版本库缓存，直接读取本地生成的物理文件
-          echo "Compiling Core..."
-          go build -mod=mod -v -o ../make/photon/core/harbor_core ./core
-          
-          echo "Compiling Jobservice..."
-          go build -mod=mod -v -o ../make/photon/jobservice/harbor_jobservice ./jobservice
-          
-          echo "Compiling Registryctl..."
-          go build -mod=mod -v -o ../make/photon/registryctl/harbor_registryctl ./registryctl
-
-      # 补全 Docker 构建所需的静态文件 (否则 Dockerfile COPY 会报错)
-      - name: Prepare Static Resources
-        run: |
-          cd harbor_src
-          cp -r src/core/static make/photon/core/
-          cp -r src/core/views make/photon/core/
-          # 还需要这个配置文件模板
-          cp src/core/app.conf make/photon/core/ || true
-
-      - name: Patch Redis for ARM
-        run: |
-          cd harbor_src
-          sed -i 's/--with-lg-page=12/--with-lg-page=16/g' make/photon/redis/Dockerfile || true
-
-      - name: Build and Push Core Image
-        run: |
-          docker buildx build \
-            --platform linux/arm64 \
-            --build-arg harbor_base_namespace=goharbor \
-            --build-arg harbor_base_image_version=v2.10.3 \
-            -t ghcr.io/${{ github.repository_owner }}/harbor-core:v2.10.3-arm64 \
-            -f harbor_src/make/photon/core/Dockerfile ./harbor_src/make/photon/core --push
-
-      - name: Build and Push Redis Image
-        run: |
-          docker buildx build \
-            --platform linux/arm64 \
-            --build-arg harbor_base_namespace=goharbor \
-            --build-arg harbor_base_image_version=v2.10.3 \
-            -t ghcr.io/${{ github.repository_owner }}/harbor-redis:v2.10.3-arm64 \
-            -f harbor_src/make/photon/redis/Dockerfile ./harbor_src/make/photon/redis --push
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
