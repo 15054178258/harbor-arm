@@ -18,12 +18,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
+      # 注意：去掉了 Buildx 和 QEMU 插件，避免 containerd 存储冲突
+      
       - name: Prepare Full ARM64 Images
         id: prepare_images
         run: |
@@ -31,7 +27,9 @@ jobs:
           SOURCE_REGISTRY="ghcr.io/octohelm/harbor"
           TARGET_REGISTRY="goharbor"
           
-          # 核心镜像列表：完整对齐官方 offline installer
+          # 开启 Docker 实验性功能以支持 --platform
+          export DOCKER_CLI_EXPERIMENTAL=enabled
+          
           declare -A IMAGES=(
             ["harbor-log"]="harbor-log"
             ["registry-photon"]="registry-photon"
@@ -45,7 +43,7 @@ jobs:
             ["harbor-exporter"]="harbor-exporter"
             ["chartmuseum-photon"]="chartmuseum-photon"
             ["trivy-adapter-photon"]="trivy-adapter-photon"
-            ["prepare"]="harbor-prepare"
+            ["prepare-photon"]="harbor-prepare"
           )
           
           echo "🚀 正在处理全量 ARM64 镜像..."
@@ -55,7 +53,7 @@ jobs:
             TARGET_IMG="$TARGET_REGISTRY/${IMAGES[$KEY]}:$VERSION"
             
             echo "📥 Pulling: $SOURCE_IMG"
-            # 尝试拉取，如果失败则输出警告并跳过（兼容部分版本缺少组件的情况）
+            # 使用原生 docker pull，确保镜像进入原生存储池
             if docker pull --platform linux/arm64 "$SOURCE_IMG"; then
                 docker tag "$SOURCE_IMG" "$TARGET_IMG"
                 FINAL_TAGS+=("$TARGET_IMG")
@@ -66,7 +64,9 @@ jobs:
           done
           
           echo "📦 正在生成最终镜像包 (tar.gz)..."
+          # 直接保存为 tar 
           docker save "${FINAL_TAGS[@]}" -o harbor.$VERSION.tar
+          # 随后压缩
           gzip -9 harbor.$VERSION.tar
           echo "IMAGE_FILE=harbor.$VERSION.tar.gz" >> $GITHUB_ENV
 
@@ -81,11 +81,10 @@ jobs:
           echo "🛠️ 正在替换架构包..."
           tar -xvf "$INSTALLER_FILE"
           
-          # 官方包解压后会有 harbor/ 目录，里面有原版的 harbor.v2.x.tar.gz
-          # 我们用自己生成的全量 ARM 包直接覆盖它
+          # 替换官方包里的镜像包
           mv "harbor.$VERSION.tar.gz" "harbor/harbor.$VERSION.tar.gz"
           
-          # 重新压缩为 ARM 版安装包
+          # 重新压缩
           FINAL_PACKAGE="harbor-arm64-installer-$VERSION.tgz"
           tar -zcvf "$FINAL_PACKAGE" harbor/
           echo "FINAL_PACKAGE=$FINAL_PACKAGE" >> $GITHUB_ENV
@@ -99,19 +98,11 @@ jobs:
             ### Harbor ARM64 离线安装包
             - **版本**: ${{ github.event.inputs.version }}
             - **架构**: linux/arm64
-            - **构建时间**: ${{ github.event.repository.updated_at }}
             
             **包含组件**:
-            - Harbor Core / Jobservice / Portal / Log
-            - Registry / Registryctl
-            - Redis / Nginx / DB (Postgres)
+            - 核心服务 + 数据库 + Redis + Nginx
             - Exporter / Chartmuseum / Trivy Adapter
             - **Prepare (关键安装组件)**
-            
-            **使用方法**:
-            1. 下载后上传至 ARM 服务器。
-            2. `tar -xvf harbor-arm64-installer-${{ github.event.inputs.version }}.tgz`
-            3. 修改 `harbor.yml` 后执行 `./install.sh`
           files: |
             harbor-arm64-installer-*.tgz
         env:
