@@ -18,18 +18,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 注意：去掉了 Buildx 和 QEMU 插件，避免 containerd 存储冲突
-      
-      - name: Prepare Full ARM64 Images
+      - name: Install Skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+      - name: Prepare Full ARM64 Images (via Skopeo)
         id: prepare_images
         run: |
           VERSION="${{ github.event.inputs.version }}"
           SOURCE_REGISTRY="ghcr.io/octohelm/harbor"
           TARGET_REGISTRY="goharbor"
           
-          # 开启 Docker 实验性功能以支持 --platform
-          export DOCKER_CLI_EXPERIMENTAL=enabled
-          
+          # 修正映射：octohelm 端的 key 为 prepare
           declare -A IMAGES=(
             ["harbor-log"]="harbor-log"
             ["registry-photon"]="registry-photon"
@@ -43,30 +44,33 @@ jobs:
             ["harbor-exporter"]="harbor-exporter"
             ["chartmuseum-photon"]="chartmuseum-photon"
             ["trivy-adapter-photon"]="trivy-adapter-photon"
-            ["prepare-photon"]="harbor-prepare"
+            ["prepare"]="harbor-prepare" 
           )
           
-          echo "🚀 正在处理全量 ARM64 镜像..."
-          FINAL_TAGS=()
+          mkdir -p ./images_dir
+          
+          echo "🚀 正在通过 Skopeo 下载并打标 ARM64 镜像..."
           for KEY in "${!IMAGES[@]}"; do
-            SOURCE_IMG="$SOURCE_REGISTRY/$KEY:$VERSION"
-            TARGET_IMG="$TARGET_REGISTRY/${IMAGES[$KEY]}:$VERSION"
+            SOURCE_IMG="docker://$SOURCE_REGISTRY/$KEY:$VERSION"
+            LOCAL_NAME="${IMAGES[$KEY]}"
             
-            echo "📥 Pulling: $SOURCE_IMG"
-            # 使用原生 docker pull，确保镜像进入原生存储池
-            if docker pull --platform linux/arm64 "$SOURCE_IMG"; then
-                docker tag "$SOURCE_IMG" "$TARGET_IMG"
-                FINAL_TAGS+=("$TARGET_IMG")
-                echo "✅ Tagged: $TARGET_IMG"
+            echo "📥 Copying: $SOURCE_IMG"
+            # 使用 skopeo 直接拉取 arm64 架构并保存为本地 docker-archive 格式
+            if skopeo copy --override-os linux --override-arch arm64 --src-tls-verify=true \
+               "$SOURCE_IMG" "docker-archive:./images_dir/$LOCAL_NAME.tar:$TARGET_REGISTRY/$LOCAL_NAME:$VERSION"; then
+                echo "✅ Saved: $LOCAL_NAME"
             else
-                echo "⚠️ Skip: $SOURCE_IMG 不存在于源仓库"
+                echo "⚠️ Skip: $SOURCE_IMG 不存在"
             fi
           done
           
-          echo "📦 正在生成最终镜像包 (tar.gz)..."
-          # 直接保存为 tar 
-          docker save "${FINAL_TAGS[@]}" -o harbor.$VERSION.tar
-          # 随后压缩
+          echo "📦 正在合并镜像并生成最终安装包所需的 harbor.tar.gz..."
+          # 将所有分块 tar 加载到本地 docker（本地加载不涉及架构校验，不会报错）
+          for f in ./images_dir/*.tar; do docker load -i "$f"; done
+          
+          # 获取所有打标为 goharbor 的镜像并保存
+          FINAL_TAGS=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep "$TARGET_REGISTRY/")
+          docker save $FINAL_TAGS -o harbor.$VERSION.tar
           gzip -9 harbor.$VERSION.tar
           echo "IMAGE_FILE=harbor.$VERSION.tar.gz" >> $GITHUB_ENV
 
@@ -75,16 +79,13 @@ jobs:
           VERSION="${{ github.event.inputs.version }}"
           INSTALLER_FILE="harbor-offline-installer-$VERSION.tgz"
           
-          echo "📥 下载官方离线安装包模板..."
+          echo "📥 下载官方安装包模板..."
           wget -q "https://github.com/goharbor/harbor/releases/download/$VERSION/$INSTALLER_FILE"
           
-          echo "🛠️ 正在替换架构包..."
+          echo "🛠️ 替换镜像文件..."
           tar -xvf "$INSTALLER_FILE"
-          
-          # 替换官方包里的镜像包
           mv "harbor.$VERSION.tar.gz" "harbor/harbor.$VERSION.tar.gz"
           
-          # 重新压缩
           FINAL_PACKAGE="harbor-arm64-installer-$VERSION.tgz"
           tar -zcvf "$FINAL_PACKAGE" harbor/
           echo "FINAL_PACKAGE=$FINAL_PACKAGE" >> $GITHUB_ENV
@@ -95,15 +96,12 @@ jobs:
           tag_name: ${{ github.event.inputs.version }}-arm64
           name: Harbor ARM64 Release ${{ github.event.inputs.version }}
           body: |
-            ### Harbor ARM64 离线安装包
+            ### Harbor ARM64 离线安装包 (Octohelm Source)
             - **版本**: ${{ github.event.inputs.version }}
             - **架构**: linux/arm64
             
-            **包含组件**:
-            - 核心服务 + 数据库 + Redis + Nginx
-            - Exporter / Chartmuseum / Trivy Adapter
-            - **Prepare (关键安装组件)**
-          files: |
-            harbor-arm64-installer-*.tgz
+            **包含组件**: 
+            Core, DB, Redis, Nginx, Jobservice, Registry, Exporter, Chartmuseum, Trivy Adapter, 以及 **Prepare** 环境。
+          files: harbor-arm64-installer-*.tgz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
