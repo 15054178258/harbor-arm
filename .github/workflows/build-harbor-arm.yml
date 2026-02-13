@@ -45,7 +45,7 @@ jobs:
             ["harbor-exporter"]="harbor-exporter"
             ["chartmuseum-photon"]="chartmuseum-photon"
             ["trivy-adapter-photon"]="trivy-adapter-photon"
-            ["prepare-photon"]="harbor-prepare"
+            ["prepare"]="harbor-prepare"
           )
           
           echo "🚀 正在处理全量 ARM64 镜像..."
